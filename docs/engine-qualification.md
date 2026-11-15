@@ -1,5 +1,7 @@
 # Engine qualification — November 15, 2026
 
+Historical first CLI prototype results. The native GUI and additional features have since been implemented; see [desktop-validation.md](desktop-validation.md) for current observations and remaining qualification.
+
 ## Implemented
 
 The initial Windows 11 x64 command-line prototype lists monitors, records a selected monitor to silent H.264 MP4 at 30 fps, scales proportionally within 1920 x 1080, and exposes idle/capture/recording memory checks. It has a single latest-frame slot and synchronous Media Foundation sample submission. A fixed output timeline repeats static content and errors when encoding falls substantially behind.

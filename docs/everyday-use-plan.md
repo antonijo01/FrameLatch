@@ -1,6 +1,16 @@
 # FrameLatch everyday-use implementation plan
 
-Updated November 15, 2026. This document defines the next implementation units. The broader requirements remain in implementation-plan.md. Features below are planned unless explicitly marked implemented.
+Updated November 15, 2026. The A–D features are implemented and the available-machine desktop checks are complete. The broader requirements remain in implementation-plan.md. The original acceptance criteria below remain a checklist, not a claim that every hardware scenario has passed. See desktop-validation.md for observed results and remaining limits.
+
+## Implementation decisions
+
+The small native application uses gui.rs, area.rs, click.rs, audio.rs and the existing record.rs engine. Native controls avoid a browser runtime. CPAL 0.16 supplies Windows microphone capture; AAC retains a supported device's native 44.1 or 48 kHz rate instead of adding resampling. Input stays closed when microphone is Off and when idle.
+
+Portrait presets fit the entire selected source within 1080 × 1920 or 720 × 1280, adding black bars. This replaces the proposed center-crop guide and prevents silently cutting off content. Selecting a tall area produces a fuller portrait composition. Landscape presets retain proportional source dimensions within 1080p/720p limits; an exact padded landscape canvas remains optional future work.
+
+Window selection uses a list of windows present when the app opens. Reopen the app to refresh the list. Window size changes stop capture and preserve a partial recording instead of dynamically changing the composition. Region selection is monitor-local. Ring/ripple display the latest click for 450 ms, with a single bounded event slot instead of a queue of simultaneous effects. Click effects default to Off and can be selected and remembered. These choices keep the first implementation small.
+
+Settings use a small text file under LocalAppData/FrameLatch, avoiding an extra serialization dependency. Source, quality, microphone and click style are validated before use. A microphone's unique device name is the current identity; ambiguous duplicate names are rejected. A separate microphone level-check tool and pause/resume are not part of this delivery.
 
 ## Outcome and delivery order
 
