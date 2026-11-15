@@ -1,5 +1,7 @@
 # Desktop validation — November 15, 2026
 
+The later compact dark panel, recording toolbar and custom-icon validation is in [dark-panel.md](dark-panel.md). The observations below cover the initial interface and recording engine.
+
 Development machine: Windows 11, one 3000 × 1876 display at 200% scaling, Intel Arc 140T. Tests use actual Windows mouse/keyboard input, native controls, captured output and FFprobe/FFmpeg inspection. Numeric observations are not promises for other hardware.
 
 ## Tests completed during implementation

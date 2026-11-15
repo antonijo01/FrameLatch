@@ -169,6 +169,14 @@ unsafe extern "system" fn window(hwnd: Handle, msg: u32, w: usize, l: isize) -> 
             });
             0
         }
+        0x10 | 0x02 => {
+            SELECT.with(|s| {
+                if let Some(s) = s.borrow_mut().as_mut() {
+                    s.done = true;
+                }
+            });
+            0
+        }
         0x100 if w == 27 => {
             SELECT.with(|s| {
                 if let Some(s) = s.borrow_mut().as_mut() {
