@@ -1,5 +1,7 @@
 # FrameLatch implementation plan
 
+The detailed next implementation units and everyday workflow are in [everyday-use-plan.md](everyday-use-plan.md). Current prototype measurements are in [engine-qualification.md](engine-qualification.md).
+
 Approved scope from the November 15, 2026 planning discussion.
 
 FrameLatch is a minimal native Rust Windows screen recorder with low idle resource use and local compressed output. Initial platform is Windows 11 x64. The name is a working name whose availability has not been checked. Resource budgets below are targets requiring measurements.
@@ -109,7 +111,7 @@ Deliver release executable, usage guide and measured resource report. Keep captu
 
 ## Build order and progress
 
-1. Engine qualification and memory checks — in progress.
+1. Engine prototype and short recording/memory checks — implemented and independently verified. Long-session stability, GPU memory and complete performance qualification remain pending.
 2. Native control window and save lifecycle — pending.
 3. Region selection and framing — pending.
 4. Microphone synchronization — pending.
