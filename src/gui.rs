@@ -968,12 +968,12 @@ fn update_summary(s: &State) {
             "Microphone: off"
         },
     );
-    let quality = match unsafe { SendMessageW(s.quality, 0x147, 0, 0) } {
-        1 => "720p · Landscape",
-        2 => "1080p · Portrait",
-        3 => "720p · Portrait",
-        _ => "1080p · Landscape",
-    };
+    let selected_quality = unsafe { SendMessageW(s.quality, 0x147, 0, 0) };
+    let quality = usize::try_from(selected_quality)
+        .ok()
+        .and_then(crate::quality::Quality::from_index)
+        .unwrap_or(crate::quality::Quality::Standard)
+        .summary();
     let clicks = match unsafe { SendMessageW(s.click_style, 0x147, 0, 0) } {
         1 => "Red ring",
         2 => "Red ripple",
@@ -1209,9 +1209,10 @@ fn begin(s: &mut State) {
         message(s.window, "Choose a monitor.");
         return;
     }
-    let quality = unsafe { SendMessageW(s.quality, 0x147, 0, 0) };
-    let small = quality == 1 || quality == 3;
-    let vertical = quality == 2 || quality == 3;
+    let quality = usize::try_from(unsafe { SendMessageW(s.quality, 0x147, 0, 0) })
+        .ok()
+        .and_then(crate::quality::Quality::from_index)
+        .unwrap_or(crate::quality::Quality::Standard);
     let click_style = unsafe { SendMessageW(s.click_style, 0x147, 0, 0) }.clamp(0, 2) as u8;
     let selected_mic = unsafe { SendMessageW(s.microphone, 0x147, 0, 0) };
     let mic_index = if selected_mic > 0 {
@@ -1322,13 +1323,12 @@ fn begin(s: &mut State) {
             86_400,
             &path,
             signal,
-            small,
+            quality,
             mic_index,
             mic_name,
             window_handle,
             crop,
             click_style,
-            vertical,
             ready_worker,
         )
         .map(|_| path)
@@ -2042,6 +2042,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             "Small file · 720p",
             "Portrait 1080 × 1920 · fit with bars",
             "Portrait 720 × 1280 · fit with bars",
+            "High · up to 1440p",
+            "Ultra · up to 4K",
+            "Original · native resolution",
         ] {
             SendMessageW(quality, 0x143, 0, wide(label).as_ptr() as isize);
         }
@@ -2154,9 +2157,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let invalid_settings = unknown_version
             || (!saved.is_empty() && !(3..=5).contains(&saved.len()))
             || (versioned && saved.len() != 5)
-            || saved
-                .get(2)
-                .is_some_and(|v| v.parse::<usize>().map_or(true, |n| n > 3))
+            || saved.get(2).is_some_and(|v| {
+                v.parse::<usize>()
+                    .ok()
+                    .and_then(crate::quality::Quality::from_index)
+                    .is_none()
+            })
             || saved
                 .get(4)
                 .is_some_and(|v| v.parse::<usize>().map_or(true, |n| n > 2));
@@ -2194,7 +2200,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         SendMessageW(
             quality,
             0x14e,
-            saved[2].parse::<usize>().unwrap_or(0).min(3),
+            saved[2]
+                .parse::<usize>()
+                .ok()
+                .filter(|n| crate::quality::Quality::from_index(*n).is_some())
+                .unwrap_or(0),
             0,
         );
         let saved_mic = if !saved[3].is_empty()

@@ -1,3 +1,4 @@
+use crate::quality::Quality;
 use std::{
     error::Error,
     path::Path,
@@ -106,7 +107,7 @@ unsafe fn writer(
     path: &Path,
     width: u32,
     height: u32,
-    small: bool,
+    quality: Quality,
     audio: Option<(u32, u16)>,
 ) -> windows::core::Result<(IMFSinkWriter, u32, Option<u32>)> {
     unsafe {
@@ -122,10 +123,7 @@ unsafe fn writer(
         let output = MFCreateMediaType()?;
         output.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         output.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_H264)?;
-        output.SetUINT32(
-            &MF_MT_AVG_BITRATE,
-            if small { 3_000_000 } else { 8_000_000 },
-        )?;
+        output.SetUINT32(&MF_MT_AVG_BITRATE, quality.bitrate(width, height))?;
         output.SetUINT32(&MF_MT_INTERLACE_MODE, 2)?;
         output.SetUINT64(&MF_MT_FRAME_SIZE, pair(width, height))?;
         output.SetUINT64(&MF_MT_FRAME_RATE, pair(30, 1))?;
@@ -328,22 +326,6 @@ pub fn parse_crop(value: &str) -> Result<(u32, u32, u32, u32), Box<dyn Error>> {
     }
     Ok((parts[0], parts[1], parts[2], parts[3]))
 }
-fn output_size(source_width: u32, source_height: u32, small: bool) -> Option<(u32, u32)> {
-    if source_width == 0 || source_height == 0 {
-        return None;
-    }
-    let (max_width, max_height) = if small {
-        (1280.0, 720.0)
-    } else {
-        (1920.0, 1080.0)
-    };
-    let scale = (max_width / f64::from(source_width))
-        .min(max_height / f64::from(source_height))
-        .min(1.0);
-    let width = ((f64::from(source_width) * scale) as u32) & !1;
-    let height = ((f64::from(source_height) * scale) as u32) & !1;
-    (width >= 2 && height >= 2).then_some((width, height))
-}
 fn fit_content(crop_width: u32, crop_height: u32, width: u32, height: u32) -> (u32, u32, u32, u32) {
     let scale = (width as f64 / crop_width as f64).min(height as f64 / crop_height as f64);
     let content_width = ((crop_width as f64 * scale) as u32).max(1).min(width);
@@ -361,13 +343,12 @@ pub fn record_internal(
     seconds: u64,
     path: &Path,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    small: bool,
+    quality: Quality,
     mic_index: Option<usize>,
     mic_name: Option<&str>,
     window_handle: Option<usize>,
     crop: Option<(u32, u32, u32, u32)>,
     click_style: u8,
-    vertical: bool,
 ) -> Result<(), Box<dyn Error>> {
     if !(1..=86_400).contains(&seconds) || path.exists() {
         return Err("Duration must be positive and output must not already exist".into());
@@ -463,14 +444,16 @@ pub fn record_internal(
         {
             return Err("Selected area is outside the display".into());
         }
-        let (width, height) = if vertical {
-            if small { (720, 1280) } else { (1080, 1920) }
-        } else {
-            output_size(crop.2, crop.3, small).ok_or("Capture dimensions too small")?
-        };
+        let (width, height) = quality
+            .dimensions(crop.2, crop.3)
+            .ok_or("Capture dimensions too small")?;
+        width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("Capture dimensions exceed supported buffer size")?;
         let content = fit_content(crop.2, crop.3, width, height);
         let (sink, stream, audio_stream) =
-            unsafe { writer(&tmp, width, height, small, audio_format)? };
+            unsafe { writer(&tmp, width, height, quality, audio_format)? };
         let capture_result = (|| -> Result<(), Box<dyn Error>> {
             let start = Instant::now();
             if let Some(mic) = &mic {
@@ -596,13 +579,12 @@ pub fn record(index: usize, seconds: u64, path: &Path) -> Result<(), Box<dyn Err
         seconds,
         path,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        false,
+        Quality::Standard,
         None,
         None,
         None,
         None,
         0,
-        false,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     )
 }
@@ -613,13 +595,12 @@ pub fn record_control(
     seconds: u64,
     path: &Path,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    small: bool,
+    quality: Quality,
     mic_index: Option<usize>,
     expected_mic_name: Option<String>,
     window_handle: Option<usize>,
     crop: Option<(u32, u32, u32, u32)>,
     click_style: u8,
-    vertical: bool,
     ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     use std::{
@@ -668,7 +649,7 @@ pub fn record_control(
         .arg(index.to_string())
         .arg(seconds.to_string())
         .arg(path)
-        .arg(if small { "small" } else { "standard" })
+        .arg(quality.worker_args().0)
         .arg(
             mic_index
                 .map(|n| n.to_string())
@@ -681,7 +662,7 @@ pub fn record_control(
                 .unwrap_or_default(),
         )
         .arg(click_style.to_string())
-        .arg(if vertical { "vertical" } else { "landscape" })
+        .arg(quality.worker_args().1)
         .creation_flags(0x08000000)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -761,7 +742,7 @@ pub fn record_control(
 
 #[cfg(test)]
 mod tests {
-    use super::{audio_span, fit_content, output_size, publish_no_replace};
+    use super::{audio_span, fit_content, publish_no_replace};
     #[test]
     fn portrait_fits_entire_landscape_source_with_bars() {
         assert_eq!(fit_content(1920, 1080, 1080, 1920), (0, 656, 1080, 607));
@@ -791,12 +772,5 @@ mod tests {
             (10, 0, 5)
         );
         assert!(audio_span(100, 13_000, 30, 48_000, None).is_err());
-    }
-    #[test]
-    fn dimensions_fit_preset_and_preserve_aspect() {
-        assert_eq!(output_size(3840, 2160, false), Some((1920, 1080)));
-        assert_eq!(output_size(3840, 2160, true), Some((1280, 720)));
-        assert_eq!(output_size(3000, 1876, true), Some((1150, 720)));
-        assert_eq!(output_size(1, 0, false), None);
     }
 }

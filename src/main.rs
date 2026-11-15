@@ -3,6 +3,7 @@ mod area;
 mod audio;
 mod click;
 mod gui;
+mod quality;
 mod record;
 use std::error::Error;
 use std::sync::{
@@ -80,7 +81,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 args[2].parse()?,
                 std::path::Path::new(&args[3]),
                 stop,
-                args[4] == "small",
+                quality::Quality::from_worker(
+                    &args[4],
+                    args.get(10).is_some_and(|v| v == "vertical"),
+                )
+                .ok_or("Invalid recording quality")?,
                 if args[5] == "off" {
                     None
                 } else {
@@ -96,7 +101,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .map(|v| crate::record::parse_crop(v))
                     .transpose()?,
                 args.get(9).map(|v| v.parse()).transpose()?.unwrap_or(0),
-                args.get(10).is_some_and(|v| v == "vertical"),
             )?;
         }
         "record" if args.len() == 4 => record::record(
@@ -128,13 +132,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             args[2].parse()?,
             std::path::Path::new(&args[3]),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            false,
+            quality::Quality::Standard,
             Some(args[4].parse()?),
             None,
             None,
             None,
             0,
-            false,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )?,
         "list" if args.len() == 1 => {
