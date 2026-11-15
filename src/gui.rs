@@ -78,6 +78,7 @@ unsafe extern "system" {
     fn PostQuitMessage(code: i32);
     fn PostMessageW(hwnd: Handle, msg: u32, w: usize, l: isize) -> i32;
     fn GetDlgItem(hwnd: Handle, id: i32) -> Handle;
+    fn GetDlgCtrlID(hwnd: Handle) -> i32;
     fn SetWindowDisplayAffinity(hwnd: Handle, affinity: u32) -> i32;
     fn SetWindowTextW(hwnd: Handle, text: *const u16) -> i32;
     fn GetWindowTextW(hwnd: Handle, text: *mut u16, max: i32) -> i32;
@@ -183,6 +184,9 @@ unsafe extern "system" {
     fn CreatePen(style: i32, width: i32, color: u32) -> Handle;
     fn GetStockObject(index: i32) -> Handle;
     fn Polygon(dc: Handle, points: *const Point, count: i32) -> i32;
+    fn Ellipse(dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> i32;
+    fn MoveToEx(dc: Handle, x: i32, y: i32, old: *mut Point) -> i32;
+    fn LineTo(dc: Handle, x: i32, y: i32) -> i32;
     fn Rectangle(dc: Handle, left: i32, top: i32, right: i32, bottom: i32) -> i32;
 }
 #[link(name = "dwmapi")]
@@ -256,6 +260,9 @@ const ACCENT: u32 = 0x004548d5;
 thread_local! { static HEADER: std::cell::Cell<u32> = const { std::cell::Cell::new(92) }; }
 thread_local! { static MICA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 thread_local! { static BRUSH: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
+thread_local! { static PANEL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+thread_local! { static DETAIL_FONT: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
+thread_local! { static PRIMARY_FONT: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
 thread_local! { static FONT: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -304,16 +311,61 @@ fn control(
             std::ptr::null(),
         )
     };
-    FONT.with(|font| unsafe {
-        SendMessageW(hwnd, 0x30, font.get() as usize, 1);
+    unsafe {
+        SendMessageW(hwnd, 0x30, font_for(id as u32) as usize, 1);
         if cls == "COMBOBOX" {
             SetWindowSubclass(hwnd, Some(combo_subclass), 1, 0);
         }
         if (cls == "COMBOBOX" || cls == "EDIT") && !high_contrast() {
             SetWindowTheme(hwnd, wide("DarkMode_Explorer").as_ptr(), std::ptr::null());
         }
-    });
+    }
     hwnd
+}
+fn font_for(id: u32) -> Handle {
+    if id == 101 {
+        PRIMARY_FONT.with(|f| f.get())
+    } else if [204, 208, 209, 211].contains(&id) {
+        DETAIL_FONT.with(|f| f.get())
+    } else {
+        FONT.with(|f| f.get())
+    }
+}
+fn reset_fonts(hwnd: Handle, dpi: u32) {
+    let create = |size: u32, weight: i32| unsafe {
+        CreateFontW(
+            -((size * dpi / 96) as i32),
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            wide("Segoe UI").as_ptr(),
+        )
+    };
+    let old = FONT.with(|f| f.replace(create(14, 500)));
+    let old_detail = DETAIL_FONT.with(|f| f.replace(create(13, 400)));
+    let old_primary = PRIMARY_FONT.with(|f| f.replace(create(15, 600)));
+    unsafe {
+        for id in [
+            101, 102, 103, 104, 110, 111, 112, 113, 114, 115, 116, 117, 201, 202, 203, 204, 205,
+            206, 207, 208, 209, 210, 211, 301, 302, 303, 304,
+        ] {
+            SendMessageW(GetDlgItem(hwnd, id), 0x30, font_for(id as u32) as usize, 1);
+        }
+        for font in [old, old_detail, old_primary] {
+            if font != 0 {
+                DeleteObject(font);
+            }
+        }
+    }
 }
 fn high_contrast() -> bool {
     let mut hc = HighContrast {
@@ -382,7 +434,94 @@ fn fg_color() -> u32 {
         TEXT
     }
 }
+fn draw_glyph(dc: Handle, id: u32, left: i32, top: i32, dpi: i32, color: u32) {
+    let k = |n: i32| n * dpi / 96;
+    let line = |points: &[(i32, i32)]| unsafe {
+        if let Some((first, rest)) = points.split_first() {
+            MoveToEx(
+                dc,
+                left + k(first.0),
+                top + k(first.1),
+                std::ptr::null_mut(),
+            );
+            for (x, y) in rest {
+                LineTo(dc, left + k(*x), top + k(*y));
+            }
+        }
+    };
+    unsafe {
+        let pen = CreatePen(0, k(1).max(1), color);
+        let prev = SelectObject(dc, pen);
+        let oldbrush = SelectObject(dc, GetStockObject(5));
+        match id {
+            110 => {
+                Rectangle(dc, left + k(1), top + k(2), left + k(16), top + k(12));
+                line(&[(8, 12), (8, 15), (4, 15), (12, 15)]);
+            }
+            111 => {
+                Rectangle(dc, left + k(1), top + k(2), left + k(16), top + k(14));
+                line(&[(1, 6), (16, 6)]);
+            }
+            112 => {
+                line(&[(1, 6), (1, 2), (5, 2)]);
+                line(&[(12, 2), (16, 2), (16, 6)]);
+                line(&[(1, 10), (1, 14), (5, 14)]);
+                line(&[(12, 14), (16, 14), (16, 10)]);
+            }
+            113 => {
+                RoundRect(
+                    dc,
+                    left + k(5),
+                    top + k(1),
+                    left + k(12),
+                    top + k(11),
+                    k(6),
+                    k(6),
+                );
+                line(&[
+                    (2, 8),
+                    (2, 10),
+                    (4, 13),
+                    (8, 14),
+                    (12, 13),
+                    (14, 10),
+                    (14, 8),
+                ]);
+                line(&[(8, 14), (8, 16)]);
+            }
+            114 => {
+                Ellipse(dc, left + k(3), top + k(3), left + k(14), top + k(14));
+                Ellipse(dc, left + k(7), top + k(7), left + k(10), top + k(10));
+                line(&[(8, 0), (8, 3)]);
+                line(&[(8, 14), (8, 17)]);
+                line(&[(0, 8), (3, 8)]);
+                line(&[(14, 8), (17, 8)]);
+            }
+            210 => {
+                line(&[
+                    (1, 4),
+                    (1, 14),
+                    (16, 14),
+                    (16, 5),
+                    (8, 5),
+                    (6, 3),
+                    (1, 3),
+                    (1, 4),
+                ]);
+            }
+            _ => {}
+        }
+        SelectObject(dc, oldbrush);
+        SelectObject(dc, prev);
+        DeleteObject(pen);
+    }
+}
 fn draw_button(item: &DrawItem) {
+    if item.id == 210 {
+        let dpi = unsafe { GetDpiForWindow(item.hwnd).max(96) } as i32;
+        draw_glyph(item.dc, 210, item.rect.left, item.rect.top, dpi, fg_color());
+        return;
+    }
     let selected = STATE.with(|cell| {
         cell.try_borrow()
             .ok()
@@ -406,6 +545,8 @@ fn draw_button(item: &DrawItem) {
         ACCENT
     } else if selected {
         0x00534b49
+    } else if (110..=112).contains(&item.id) {
+        0x002d2a29
     } else {
         SURFACE
     };
@@ -419,7 +560,11 @@ fn draw_button(item: &DrawItem) {
     } else if high {
         text_color
     } else {
-        0x00544f4d
+        if (110..=112).contains(&item.id) {
+            fill
+        } else {
+            0x00544f4d
+        }
     };
     unsafe {
         let brush = CreateSolidBrush(fill);
@@ -441,32 +586,100 @@ fn draw_button(item: &DrawItem) {
         DeleteObject(pen);
         DeleteObject(brush);
         let label = text(item.hwnd);
-        let label = wide(&label);
+        let display_label = if item.id == 116 || item.id == 117 {
+            "Change"
+        } else {
+            &label
+        };
+        let text_wide = wide(display_label);
         let mut rect = item.rect;
+        let dpi = GetDpiForWindow(item.hwnd).max(96) as i32;
+        let k = |n: i32| n * dpi / 96;
+        let mid = (rect.top + rect.bottom) / 2;
+        if (110..=112).contains(&item.id) {
+            draw_glyph(
+                item.dc,
+                item.id,
+                rect.left + k(17),
+                mid - k(8),
+                dpi,
+                text_color,
+            );
+            rect.left += k(18);
+        }
+        if item.id == 113 || item.id == 114 {
+            draw_glyph(
+                item.dc,
+                item.id,
+                rect.left + k(12),
+                mid - k(8),
+                dpi,
+                text_color,
+            );
+            rect.left += k(29);
+        }
+        if item.id == 113 {
+            let track = if selected { ACCENT } else { 0x00605b59 };
+            let brush = CreateSolidBrush(track);
+            let oldb = SelectObject(item.dc, brush);
+            let pen = CreatePen(0, 1, track);
+            let oldp = SelectObject(item.dc, pen);
+            let right = item.rect.right - k(12);
+            let left = right - k(30);
+            RoundRect(item.dc, left, mid - k(8), right, mid + k(8), k(16), k(16));
+            SelectObject(item.dc, oldp);
+            SelectObject(item.dc, oldb);
+            DeleteObject(pen);
+            DeleteObject(brush);
+            let knob = CreateSolidBrush(TEXT);
+            let oldb = SelectObject(item.dc, knob);
+            let x = if selected { right - k(13) } else { left + k(3) };
+            Ellipse(item.dc, x, mid - k(5), x + k(10), mid + k(5));
+            SelectObject(item.dc, oldb);
+            DeleteObject(knob);
+            rect.right -= k(45);
+        }
+        if item.id == 101 && label.starts_with("Start") {
+            let dot = CreateSolidBrush(TEXT);
+            let old = SelectObject(item.dc, dot);
+            let x = (rect.left + rect.right) / 2 - k(75);
+            Ellipse(item.dc, x, mid - k(5), x + k(10), mid + k(5));
+            SelectObject(item.dc, old);
+            DeleteObject(dot);
+            rect.left += k(14);
+        }
+        let font = font_for(item.id);
+        let oldfont = SelectObject(item.dc, font);
         SetBkMode(item.dc, 1);
         SetTextColor(item.dc, text_color);
+        let align = if item.id == 113 { 0 } else { 1 };
         DrawTextW(
             item.dc,
-            label.as_ptr(),
+            text_wide.as_ptr(),
             -1,
             &mut rect,
-            0x1 | 0x4 | 0x20 | 0x8000,
+            align | 0x4 | 0x20 | 0x8000,
         );
+        SelectObject(item.dc, oldfont);
     }
 }
 fn position_controls(s: &State, dpi: i32) {
     let scale = |n: i32| n * dpi / 96;
     let controls = [
-        (110, 20, 15, 122, 31),
-        (111, 154, 15, 122, 31),
-        (112, 288, 15, 122, 31),
-        (207, 20, 57, 390, 200),
-        (113, 20, 101, 190, 32),
-        (114, 220, 101, 190, 32),
-        (208, 20, 143, 390, 20),
-        (209, 20, 171, 390, 20),
-        (103, 20, 278, 190, 28),
-        (104, 220, 278, 190, 28),
+        (110, 23, 15, 126, 31),
+        (111, 151, 15, 126, 31),
+        (112, 279, 15, 128, 31),
+        (207, 20, 55, 390, 180),
+        (211, 20, 84, 300, 20),
+        (117, 325, 82, 85, 24),
+        (113, 20, 111, 235, 34),
+        (114, 265, 111, 145, 34),
+        (208, 20, 153, 390, 19),
+        (210, 20, 179, 18, 18),
+        (209, 44, 179, 255, 18),
+        (116, 320, 175, 90, 25),
+        (103, 275, 274, 135, 28),
+        (104, 166, 274, 100, 28),
         (115, 20, 15, 115, 30),
         (301, 20, 58, 390, 20),
         (202, 20, 80, 390, 200),
@@ -589,7 +802,37 @@ unsafe extern "system" fn combo_subclass(
             let border = CreatePen(0, scale(1).max(1), 0x00544f4d);
             let oldpen = SelectObject(dc, border);
             let oldbrush = SelectObject(dc, GetStockObject(5));
-            Rectangle(dc, r.left, r.top, r.right, r.bottom);
+            let corner = CreateSolidBrush(bg_color());
+            for corner_rect in [
+                Rect {
+                    left: r.left,
+                    top: r.top,
+                    right: r.left + scale(3),
+                    bottom: r.top + scale(3),
+                },
+                Rect {
+                    left: r.right - scale(3),
+                    top: r.top,
+                    right: r.right,
+                    bottom: r.top + scale(3),
+                },
+                Rect {
+                    left: r.left,
+                    top: r.bottom - scale(3),
+                    right: r.left + scale(3),
+                    bottom: r.bottom,
+                },
+                Rect {
+                    left: r.right - scale(3),
+                    top: r.bottom - scale(3),
+                    right: r.right,
+                    bottom: r.bottom,
+                },
+            ] {
+                FillRect(dc, &corner_rect, corner);
+            }
+            DeleteObject(corner);
+            RoundRect(dc, r.left, r.top, r.right, r.bottom, scale(8), scale(8));
             SelectObject(dc, oldbrush);
             SelectObject(dc, oldpen);
             DeleteObject(border);
@@ -628,6 +871,7 @@ struct State {
     hotkey: bool,
     pending_close: bool,
     monitor_ids: Vec<String>,
+    monitor_sizes: Vec<(u32, u32)>,
     windows: Vec<(usize, u32)>,
     area: Option<(usize, (u32, u32, u32, u32))>,
     picker: Handle,
@@ -680,7 +924,41 @@ fn refresh_picker(s: &mut State) {
         }
     }
 }
+fn source_detail(
+    mode: u8,
+    area: Option<(u32, u32, u32, u32)>,
+    screen: Option<(u32, u32)>,
+) -> String {
+    match mode {
+        2 => area
+            .map(|(_, _, w, h)| format!("Selected area · {w} × {h}"))
+            .unwrap_or_else(|| "Select an area to record".into()),
+        1 => "Selected window".into(),
+        _ => screen
+            .map(|(w, h)| format!("Screen · {w} × {h}"))
+            .unwrap_or_else(|| "Select a screen".into()),
+    }
+}
 fn update_summary(s: &State) {
+    let index = unsafe { SendMessageW(s.source, 0x147, 0, 0) };
+    let area = s.area.map(|(_, rect)| rect);
+    let screen = usize::try_from(index)
+        .ok()
+        .and_then(|i| s.monitor_sizes.get(i).copied());
+    set(
+        unsafe { GetDlgItem(s.window, 211) },
+        &source_detail(s.mode, area, screen),
+    );
+    unsafe {
+        ShowWindow(
+            GetDlgItem(s.window, 117),
+            if s.mode == 2 && !s.settings_open && s.stop.is_none() && s.countdown.is_none() {
+                1
+            } else {
+                0
+            },
+        );
+    }
     let mic = unsafe { SendMessageW(s.microphone, 0x147, 0, 0) };
     set(
         unsafe { GetDlgItem(s.window, 113) },
@@ -712,7 +990,7 @@ fn update_summary(s: &State) {
         .unwrap_or_else(|| folder.to_string_lossy().into_owned());
     set(
         unsafe { GetDlgItem(s.window, 209) },
-        &format!("Saves to  {display}"),
+        &format!("Saves to {display}"),
     );
     unsafe {
         for id in [110, 111, 112, 113] {
@@ -720,13 +998,15 @@ fn update_summary(s: &State) {
         }
     }
 }
-fn header_height(target: View) -> u32 {
-    if target == View::Settings { 50 } else { 92 }
+fn client_glass_height(target: View) -> u32 {
+    let _ = target;
+    0
 }
 fn layout(s: &State) {
     let active = s.stop.is_some() || s.countdown.is_some();
     let target = view(s.settings_open, active);
-    let header = header_height(target);
+    PANEL.with(|panel| panel.set(target == View::Panel));
+    let header = client_glass_height(target);
     HEADER.with(|cell| cell.set(header));
     if MICA.with(|cell| cell.get()) {
         let margins = Margins {
@@ -739,7 +1019,7 @@ fn layout(s: &State) {
             DwmExtendFrameIntoClientArea(s.window, &margins);
         }
     }
-    let panel = [110, 111, 112, 207, 113, 114, 208, 209];
+    let panel = [110, 111, 112, 207, 113, 114, 116, 208, 209, 210, 211];
     let settings = [115, 202, 205, 206, 203, 102, 301, 302, 303, 304];
     unsafe {
         for id in panel {
@@ -754,10 +1034,18 @@ fn layout(s: &State) {
                 if target == View::Settings { 1 } else { 0 },
             );
         }
+        ShowWindow(
+            GetDlgItem(s.window, 117),
+            if target == View::Panel && s.mode == 2 {
+                1
+            } else {
+                0
+            },
+        );
         for id in [103, 104] {
             ShowWindow(
                 GetDlgItem(s.window, id),
-                if target == View::Panel && s.last.is_some() {
+                if target == View::Panel && s.last.as_ref().is_some_and(|path| path.is_file()) {
                     1
                 } else {
                     0
@@ -773,11 +1061,11 @@ fn layout(s: &State) {
             MoveWindow(s.status, scale(20), scale(16), scale(245), scale(26), 1);
             MoveWindow(s.button, scale(280), scale(10), scale(145), scale(40), 1);
         } else {
-            MoveWindow(s.status, scale(20), scale(251), scale(390), scale(23), 1);
-            MoveWindow(s.button, scale(20), scale(203), scale(390), scale(40), 1);
+            MoveWindow(s.status, scale(20), scale(277), scale(135), scale(23), 1);
+            MoveWindow(s.button, scale(20), scale(214), scale(390), scale(42), 1);
         }
         let (w, h) = match target {
-            View::Panel => (450, 350),
+            View::Panel => (450, 355),
             View::Settings => (450, 390),
             View::Toolbar => (460, 110),
         };
@@ -1203,45 +1491,12 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
                     DwmExtendFrameIntoClientArea(hwnd, &margins);
                 }
             }
-            let font = unsafe {
-                CreateFontW(
-                    -((14 * dpi / 96) as i32),
-                    0,
-                    0,
-                    0,
-                    400,
-                    0,
-                    0,
-                    0,
-                    1,
-                    0,
-                    0,
-                    5,
-                    0,
-                    wide("Segoe UI").as_ptr(),
-                )
-            };
+            reset_fonts(hwnd, dpi);
             STATE.with(|cell| {
                 if let Ok(state) = cell.try_borrow()
                     && let Some(s) = state.as_ref()
                 {
-                    for id in [
-                        101, 102, 103, 104, 110, 111, 112, 113, 114, 115, 201, 202, 203, 204, 205,
-                        206, 207, 208, 209, 301, 302, 303, 304,
-                    ] {
-                        unsafe {
-                            SendMessageW(GetDlgItem(hwnd, id), 0x30, font as usize, 1);
-                        }
-                    }
                     layout(s);
-                }
-            });
-            FONT.with(|f| {
-                let old = f.replace(font);
-                if old != 0 {
-                    unsafe {
-                        DeleteObject(old);
-                    }
                 }
             });
             0
@@ -1255,7 +1510,13 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
         0x0133 | 0x0134 | 0x0135 | 0x0138 => {
             let dc = w as Handle;
             unsafe {
-                SetTextColor(dc, fg_color());
+                let id = GetDlgCtrlID(l as Handle);
+                let color = if !high_contrast() && [204, 208, 209, 211].contains(&id) {
+                    0x00bcb5b1
+                } else {
+                    fg_color()
+                };
+                SetTextColor(dc, color);
                 SetBkColor(dc, bg_color());
             }
             BRUSH.with(|brush| brush.get())
@@ -1271,6 +1532,24 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
             unsafe {
                 GetClientRect(hwnd, &mut rect);
                 BRUSH.with(|brush| FillRect(dc, &rect, brush.get()));
+                if PANEL.with(|panel| panel.get()) {
+                    let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+                    let k = |n: i32| n * dpi / 96;
+                    let color = if high_contrast() {
+                        GetSysColor(15)
+                    } else {
+                        0x002d2a29
+                    };
+                    let brush = CreateSolidBrush(color);
+                    let pen = CreatePen(0, 1, color);
+                    let oldb = SelectObject(dc, brush);
+                    let oldp = SelectObject(dc, pen);
+                    RoundRect(dc, k(20), k(12), k(410), k(49), k(10), k(10));
+                    SelectObject(dc, oldp);
+                    SelectObject(dc, oldb);
+                    DeleteObject(pen);
+                    DeleteObject(brush);
+                }
                 if MICA.with(|mica| mica.get()) {
                     let strip = Rect {
                         left: rect.left,
@@ -1290,8 +1569,22 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
         }
         0x111 => {
             let id = w & 0xffff;
-            if id == 112 {
+            if id == 112 || id == 117 {
                 choose_area(hwnd);
+                return 0;
+            }
+            if id == 102 || id == 116 {
+                if let Some(path) = browse_folder(hwnd) {
+                    STATE.with(|cell| {
+                        if let Ok(state) = cell.try_borrow()
+                            && let Some(s) = state.as_ref()
+                        {
+                            set(s.folder, &path);
+                            update_summary(s);
+                            save(s);
+                        }
+                    });
+                }
                 return 0;
             }
             STATE.with(|cell| {
@@ -1304,6 +1597,7 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
                             if selected >= 0 { unsafe { SendMessageW(s.source,0x14e, selected as usize + if s.mode == 1 { s.monitor_ids.len() } else { 0 },0); } }
                             s.area = None;
                             if s.mode == 2 { set(s.status, "Select Area again for this screen"); }
+                            update_summary(s);
                         }
                         110 | 111 => { s.mode = if id == 110 { 0 } else { 1 }; s.area = None; refresh_picker(s); update_summary(s); set(s.status,"Ready"); }
                         113 => {
@@ -1317,11 +1611,6 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
                         115 => { s.settings_open = false; update_summary(s); save(s); layout(s); }
                         202 | 205 | 206 if (w >> 16) == 1 => { update_summary(s); }
                         101 => click(s),
-                        102 => {
-                            if let Some(path) = browse_folder(hwnd) {
-                                set(s.folder, &path);
-                            }
-                        }
                         104 => {
                             if let Some(path) = &s.last {
                                 if !path.is_file() {
@@ -1581,23 +1870,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let corners: i32 = 2;
         DwmSetWindowAttribute(hwnd, 33, (&corners as *const i32).cast(), 4);
         let dpi = GetDpiForWindow(hwnd).max(96);
-        let font = CreateFontW(
-            -((14 * dpi / 96) as i32),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            1,
-            0,
-            0,
-            5,
-            0,
-            wide("Segoe UI").as_ptr(),
-        );
-        FONT.with(|f| f.set(font));
+        reset_fonts(hwnd, dpi);
         let source = control(
             hwnd,
             instance,
@@ -1616,6 +1889,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|m| m.device_name().unwrap_or_default())
             .collect();
+        let monitor_sizes: Vec<(u32, u32)> = monitors
+            .iter()
+            .map(|m| (m.width().unwrap_or(0), m.height().unwrap_or(0)))
+            .collect();
         for (i, m) in monitors.iter().enumerate() {
             let name = m.name().unwrap_or_default();
             let name = if name.is_empty() {
@@ -1623,13 +1900,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 name
             };
-            let label = format!(
-                "{}  ({} × {})",
-                name,
-                m.width().unwrap_or(0),
-                m.height().unwrap_or(0)
-            );
-            SendMessageW(source, 0x143, 0, wide(&label).as_ptr() as isize);
+            SendMessageW(source, 0x143, 0, wide(&name).as_ptr() as isize);
         }
         let windows: Vec<(usize, u32)> = windows_capture::window::Window::enumerate()
             .unwrap_or_default()
@@ -1673,6 +1944,32 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         control(
             hwnd, instance, "BUTTON", "Settings", 0, 220, 101, 190, 32, 114,
+        );
+        control(hwnd, instance, "STATIC", "", 0, 20, 84, 300, 20, 211);
+        control(
+            hwnd,
+            instance,
+            "BUTTON",
+            "Change selected area",
+            0,
+            325,
+            82,
+            85,
+            24,
+            117,
+        );
+        control(hwnd, instance, "STATIC", "", 0x0d, 20, 179, 18, 18, 210);
+        control(
+            hwnd,
+            instance,
+            "BUTTON",
+            "Change save folder",
+            0,
+            320,
+            175,
+            90,
+            25,
+            116,
         );
         control(hwnd, instance, "STATIC", "", 0, 20, 143, 390, 20, 208);
         control(hwnd, instance, "STATIC", "", 0, 20, 171, 390, 20, 209);
@@ -1944,6 +2241,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 hotkey,
                 pending_close: false,
                 monitor_ids,
+                monitor_sizes,
                 windows,
                 area: None,
                 picker,
@@ -1988,12 +2286,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 DispatchMessageW(&msg);
             }
         }
-        FONT.with(|f| {
-            let font = f.replace(0);
+        for font in [
+            FONT.with(|f| f.replace(0)),
+            DETAIL_FONT.with(|f| f.replace(0)),
+            PRIMARY_FONT.with(|f| f.replace(0)),
+        ] {
             if font != 0 {
                 DeleteObject(font);
             }
-        });
+        }
         if small_icon != 0 {
             DestroyIcon(small_icon);
         }
@@ -2013,7 +2314,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod ui_tests {
-    use super::{View, area_ready, header_height, view};
+    use super::{View, area_ready, client_glass_height, source_detail, view};
     #[test]
     fn active_session_always_uses_toolbar() {
         assert_eq!(view(false, false), View::Panel);
@@ -2022,10 +2323,25 @@ mod ui_tests {
         assert_eq!(view(true, true), View::Toolbar);
     }
     #[test]
-    fn glass_header_follows_view() {
-        assert_eq!(header_height(View::Settings), 50);
-        assert_eq!(header_height(View::Panel), 92);
-        assert_eq!(header_height(View::Toolbar), 92);
+    fn charcoal_client_does_not_extend_titlebar_glass() {
+        assert_eq!(client_glass_height(View::Settings), 0);
+        assert_eq!(client_glass_height(View::Panel), 0);
+        assert_eq!(client_glass_height(View::Toolbar), 0);
+    }
+    #[test]
+    fn area_summary_never_uses_full_screen_dimensions() {
+        assert_eq!(
+            source_detail(2, Some((10, 20, 800, 500)), Some((3000, 1876))),
+            "Selected area · 800 × 500"
+        );
+        assert_eq!(
+            source_detail(2, None, Some((3000, 1876))),
+            "Select an area to record"
+        );
+        assert_eq!(
+            source_detail(0, None, Some((3000, 1876))),
+            "Screen · 3000 × 1876"
+        );
     }
     #[test]
     fn cancelled_area_cannot_fall_back_to_full_screen() {

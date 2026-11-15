@@ -1,3 +1,5 @@
+> Historical validation of the first dark panel. The current refinement uses a solid charcoal client and titlebar-only material; see [reference-ui-refinement.md](reference-ui-refinement.md). Earlier dimensions and measurements below describe that earlier build.
+
 # Dark panel and recording toolbar
 
 November 15, 2026. Redesign of the native Windows control surface; the recording engine remains unchanged.
