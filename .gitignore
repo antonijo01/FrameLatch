@@ -1,0 +1,6 @@
+/target/
+/recordings/
+/work/
+*.mp4
+*.partial
+*.etl
