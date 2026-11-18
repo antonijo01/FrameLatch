@@ -176,6 +176,7 @@ dependencies = [
  "cpal",
  "windows 0.62.2",
  "windows-capture",
+ "windows-numerics",
 ]
 
 [[package]]
