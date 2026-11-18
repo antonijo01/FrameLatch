@@ -1,6 +1,6 @@
 # FrameLatch implementation plan
 
-The detailed implementation units and everyday workflow are in [everyday-use-plan.md](everyday-use-plan.md). Current feature and resource observations are in [desktop-validation.md](desktop-validation.md). [engine-qualification.md](engine-qualification.md) retains the historical first-engine measurements. The checklists below describe the intended design; they do not claim all hardware qualification has passed.
+Current interface and resource observations are in [glass-ui.md](glass-ui.md); engine observations are in [desktop-validation.md](desktop-validation.md). The checklists below describe the intended design; they do not claim all hardware qualification is complete.
 
 Approved scope from the November 15, 2026 planning discussion.
 

@@ -132,6 +132,33 @@ unsafe extern "system" {
     fn DrawTextW(dc: Handle, text: *const u16, len: i32, rect: *mut Rect, flags: u32) -> i32;
     fn GetDC(hwnd: Handle) -> Handle;
     fn ReleaseDC(hwnd: Handle, dc: Handle) -> i32;
+    fn BeginPaint(hwnd: Handle, paint: *mut PaintStruct) -> Handle;
+    fn EndPaint(hwnd: Handle, paint: *const PaintStruct) -> i32;
+    fn MapWindowPoints(from: Handle, to: Handle, points: *mut Point, count: u32) -> i32;
+    fn GetParent(hwnd: Handle) -> Handle;
+    fn GetFocus() -> Handle;
+    fn AdjustWindowRectExForDpi(rect: *mut Rect, style: u32, menu: i32, ex: u32, dpi: u32) -> i32;
+}
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn RegGetValueW(
+        key: isize,
+        subkey: *const u16,
+        value: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        size: *mut u32,
+    ) -> i32;
+}
+#[repr(C)]
+struct PaintStruct {
+    dc: Handle,
+    erase: i32,
+    paint: Rect,
+    restore: i32,
+    inc_update: i32,
+    reserved: [u8; 32],
 }
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -257,10 +284,16 @@ const BG: u32 = 0x00221f1e;
 const SURFACE: u32 = 0x0034302f;
 const TEXT: u32 = 0x00f2efed;
 const ACCENT: u32 = 0x004548d5;
-thread_local! { static HEADER: std::cell::Cell<u32> = const { std::cell::Cell::new(92) }; }
-thread_local! { static MICA: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+// Acrylic backdrop and Direct2D are both available (not high contrast, and
+// Windows transparency effects are on).
+thread_local! { static ACRYLIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 thread_local! { static BRUSH: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
-thread_local! { static PANEL: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+thread_local! { static VIEW: std::cell::Cell<View> = const { std::cell::Cell::new(View::Panel) }; }
+/// Child controls that are repainted when the material changes.
+const CONTROL_IDS: [i32; 27] = [
+    101, 102, 103, 104, 110, 111, 112, 113, 114, 115, 116, 117, 201, 202, 203, 204, 205, 206, 207,
+    208, 209, 210, 211, 301, 302, 303, 304,
+];
 thread_local! { static DETAIL_FONT: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
 thread_local! { static PRIMARY_FONT: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
 thread_local! { static FONT: std::cell::Cell<Handle> = const { std::cell::Cell::new(0) }; }
@@ -270,6 +303,10 @@ fn wide(s: &str) -> Vec<u16> {
 fn set(hwnd: Handle, s: &str) {
     unsafe {
         SetWindowTextW(hwnd, wide(s).as_ptr());
+        if hwnd != 0 {
+            // Owner-drawn labels do not always repaint on WM_SETTEXT.
+            InvalidateRect(hwnd, std::ptr::null(), 0);
+        }
     }
 }
 fn text(hwnd: Handle) -> String {
@@ -383,20 +420,20 @@ fn update_appearance(hwnd: Handle) {
         let high = high_contrast();
         let dark: i32 = if high { 0 } else { 1 };
         DwmSetWindowAttribute(hwnd, 20, (&dark as *const i32).cast(), 4);
-        let backdrop: i32 = if high { 1 } else { 2 };
-        let ok = DwmSetWindowAttribute(hwnd, 38, (&backdrop as *const i32).cast(), 4) == 0;
-        let margins = Margins {
-            left: 0,
-            right: 0,
-            top: if !high && ok {
-                (HEADER.with(|header| header.get()) * GetDpiForWindow(hwnd).max(96) / 96) as i32
-            } else {
-                0
-            },
-            bottom: 0,
-        };
-        let extended = DwmExtendFrameIntoClientArea(hwnd, &margins) == 0;
-        MICA.with(|mica| mica.set(!high && ok && extended));
+        let wanted = !high && transparency_enabled() && crate::glass::available();
+        // DWMSBT_TRANSIENTWINDOW: desktop acrylic. Windows draws it solid
+        // while the window is inactive unless the frame stays active (see
+        // WM_NCACTIVATE in `wnd`), which a recorder panel needs because it
+        // usually sits unfocused beside the app being recorded.
+        let acrylic_type: i32 = 3;
+        let acrylic =
+            wanted && DwmSetWindowAttribute(hwnd, 38, (&acrylic_type as *const i32).cast(), 4) == 0;
+        if !acrylic {
+            let backdrop: i32 = if high { 1 } else { 2 };
+            DwmSetWindowAttribute(hwnd, 38, (&backdrop as *const i32).cast(), 4);
+        }
+        ACRYLIC.with(|cell| cell.set(acrylic));
+        apply_material(hwnd);
         let brush = CreateSolidBrush(bg_color());
         SetClassLongPtrW(hwnd, -10, brush);
         BRUSH.with(|cell| {
@@ -418,6 +455,49 @@ fn update_appearance(hwnd: Handle) {
             }
         }
         InvalidateRect(hwnd, std::ptr::null(), 1);
+    }
+}
+/// Windows "Transparency effects" setting (Personalization > Colors).
+fn transparency_enabled() -> bool {
+    let mut value: u32 = 1;
+    let mut size = 4u32;
+    let status = unsafe {
+        RegGetValueW(
+            0x8000_0001u32 as i32 as isize,
+            wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize").as_ptr(),
+            wide("EnableTransparency").as_ptr(),
+            0x10,
+            std::ptr::null_mut(),
+            (&mut value as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    status != 0 || value != 0
+}
+/// Every view is owner-drawn, so all of them can sit on glass.
+fn glass_view(target: View) -> bool {
+    matches!(target, View::Panel | View::Settings | View::Toolbar)
+}
+/// Extends acrylic over the whole client for glass views, or removes it.
+fn apply_material(hwnd: Handle) {
+    let on = ACRYLIC.with(|cell| cell.get()) && glass_view(VIEW.with(|v| v.get()));
+    let edge = if on { -1 } else { 0 };
+    let margins = Margins {
+        left: edge,
+        right: edge,
+        top: edge,
+        bottom: edge,
+    };
+    unsafe {
+        let extended = DwmExtendFrameIntoClientArea(hwnd, &margins) == 0;
+        crate::glass::set_enabled(on && extended);
+        InvalidateRect(hwnd, std::ptr::null(), 1);
+        for id in CONTROL_IDS {
+            let child = GetDlgItem(hwnd, id);
+            if child != 0 {
+                InvalidateRect(child, std::ptr::null(), 1);
+            }
+        }
     }
 }
 fn bg_color() -> u32 {
@@ -517,6 +597,34 @@ fn draw_glyph(dc: Handle, id: u32, left: i32, top: i32, dpi: i32, color: u32) {
     }
 }
 fn draw_button(item: &DrawItem) {
+    if crate::glass::enabled() && draw_glass(item) {
+        return;
+    }
+    if [204, 208, 209, 211, 301, 302, 303, 304].contains(&item.id) {
+        unsafe {
+            BRUSH.with(|brush| FillRect(item.dc, &item.rect, brush.get()));
+            SetBkMode(item.dc, 1);
+            SetTextColor(
+                item.dc,
+                if high_contrast() {
+                    fg_color()
+                } else {
+                    0x00bcb5b1
+                },
+            );
+            let old = SelectObject(item.dc, DETAIL_FONT.with(|f| f.get()));
+            let mut rect = item.rect;
+            DrawTextW(
+                item.dc,
+                wide(&text(item.hwnd)).as_ptr(),
+                -1,
+                &mut rect,
+                0x4 | 0x20 | 0x8000,
+            );
+            SelectObject(item.dc, old);
+        }
+        return;
+    }
     if item.id == 210 {
         let dpi = unsafe { GetDpiForWindow(item.hwnd).max(96) } as i32;
         draw_glyph(item.dc, 210, item.rect.left, item.rect.top, dpi, fg_color());
@@ -586,8 +694,20 @@ fn draw_button(item: &DrawItem) {
         DeleteObject(pen);
         DeleteObject(brush);
         let label = text(item.hwnd);
+        let folder = if item.id == 102 {
+            STATE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .and_then(|state| state.as_ref().map(|s| text(s.folder)))
+                    .unwrap_or_default()
+            })
+        } else {
+            String::new()
+        };
         let display_label = if item.id == 116 || item.id == 117 {
             "Change"
+        } else if item.id == 102 {
+            &folder
         } else {
             &label
         };
@@ -663,33 +783,512 @@ fn draw_button(item: &DrawItem) {
         SelectObject(item.dc, oldfont);
     }
 }
+/// Parent-surface layer in parent client coordinates: the dark wash over the
+/// acrylic plus the segmented-control track on the panel.
+fn paint_backdrop(c: &crate::glass::Canvas, width: f32, height: f32) {
+    use crate::glass::*;
+    c.fill(0.0, 0.0, width, height, WASH);
+    let view = VIEW.with(|v| v.get());
+    if view == View::Panel {
+        let (x, y, w, h, r) = (c.k(24.0), c.k(16.0), c.k(496.0), c.k(44.0), c.k(12.0));
+        c.glass_card(x, y, w, h, r, CARD, 1.0);
+        // Output card: save folder, quality and click effect.
+        let (y, h) = (c.k(220.0), c.k(60.0));
+        c.glass_card(x, y, w, h, r, CARD, 1.0);
+    } else if view == View::Settings {
+        c.text(
+            "Settings",
+            c.k(124.0),
+            c.k(16.0),
+            c.k(300.0),
+            c.k(36.0),
+            18.0,
+            600,
+            Align::Left,
+            TEXT,
+        );
+    }
+}
+/// Paints a child control: the parent backdrop beneath it, then `draw` in
+/// the child's own coordinates. Children cannot be transparent on glass, so
+/// each one reproduces the part of the parent surface it covers.
+fn paint_child(child: Handle, dc: Handle, rect: Rect, draw: impl FnOnce(&crate::glass::Canvas)) {
+    unsafe {
+        let parent = GetParent(child);
+        let mut origin = Point { x: 0, y: 0 };
+        MapWindowPoints(child, parent, &mut origin, 1);
+        let mut client = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetClientRect(parent, &mut client);
+        let dpi = GetDpiForWindow(child).max(96);
+        crate::glass::paint(dc, rect.right, rect.bottom, dpi, |c| {
+            c.set_offset(-origin.x as f32, -origin.y as f32);
+            paint_backdrop(c, client.right as f32, client.bottom as f32);
+            c.set_offset(0.0, 0.0);
+            draw(c);
+        });
+    }
+}
+/// Line icons on a 17-unit grid, stroked with antialiasing.
+fn glass_glyph(c: &crate::glass::Canvas, id: u32, left: f32, top: f32, color: crate::glass::Rgba) {
+    let k = |n: f32| c.k(n);
+    let p = |x: f32, y: f32| (left + k(x), top + k(y));
+    let w = k(1.4);
+    match id {
+        110 => {
+            c.stroke_round(
+                left + k(0.5),
+                top + k(1.5),
+                k(16.0),
+                k(11.0),
+                k(2.0),
+                w,
+                color,
+            );
+            c.line(&[p(8.5, 12.5), p(8.5, 15.0)], w, color);
+            c.line(&[p(4.5, 15.5), p(12.5, 15.5)], w, color);
+        }
+        111 => {
+            c.stroke_round(
+                left + k(0.5),
+                top + k(1.5),
+                k(16.0),
+                k(13.0),
+                k(2.0),
+                w,
+                color,
+            );
+            c.line(&[p(1.0, 5.8), p(16.0, 5.8)], w, color);
+        }
+        112 => {
+            c.line(&[p(1.0, 6.0), p(1.0, 2.0), p(5.0, 2.0)], w, color);
+            c.line(&[p(12.0, 2.0), p(16.0, 2.0), p(16.0, 6.0)], w, color);
+            c.line(&[p(1.0, 10.0), p(1.0, 14.0), p(5.0, 14.0)], w, color);
+            c.line(&[p(12.0, 14.0), p(16.0, 14.0), p(16.0, 10.0)], w, color);
+        }
+        113 => {
+            c.stroke_round(
+                left + k(5.0),
+                top + k(0.5),
+                k(7.0),
+                k(11.0),
+                k(3.5),
+                w,
+                color,
+            );
+            c.line(
+                &[
+                    p(2.5, 7.5),
+                    p(2.8, 9.8),
+                    p(4.6, 12.4),
+                    p(8.5, 13.8),
+                    p(12.4, 12.4),
+                    p(14.2, 9.8),
+                    p(14.5, 7.5),
+                ],
+                w,
+                color,
+            );
+            c.line(&[p(8.5, 13.8), p(8.5, 16.5)], w, color);
+        }
+        114 => {
+            // Sliders: reads as "settings" rather than a crosshair target.
+            c.line(&[p(1.0, 4.5), p(8.0, 4.5)], w, color);
+            c.line(&[p(14.0, 4.5), p(16.0, 4.5)], w, color);
+            c.ring(left + k(11.0), top + k(4.5), k(2.6), w, color);
+            c.line(&[p(1.0, 12.5), p(3.0, 12.5)], w, color);
+            c.line(&[p(9.0, 12.5), p(16.0, 12.5)], w, color);
+            c.ring(left + k(6.0), top + k(12.5), k(2.6), w, color);
+        }
+        115 => c.line(&[p(10.5, 3.0), p(5.0, 8.5), p(10.5, 14.0)], k(1.6), color),
+        210 => {
+            c.line(
+                &[
+                    p(1.0, 4.0),
+                    p(1.0, 14.0),
+                    p(16.0, 14.0),
+                    p(16.0, 5.5),
+                    p(8.0, 5.5),
+                    p(6.0, 3.0),
+                    p(1.0, 3.0),
+                    p(1.0, 4.0),
+                ],
+                w,
+                color,
+            );
+        }
+        _ => {}
+    }
+}
+/// Owner-draw on glass. Returns false when the control has no glass design.
+fn draw_glass(item: &DrawItem) -> bool {
+    use crate::glass::*;
+    let id = item.id;
+    let label = text(item.hwnd);
+    let (mode, mic_on, folder) = STATE.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|state| {
+                state.as_ref().map(|s| {
+                    (
+                        s.mode,
+                        unsafe { SendMessageW(s.microphone, 0x147, 0, 0) > 0 },
+                        text(s.folder),
+                    )
+                })
+            })
+            .unwrap_or((0, false, String::new()))
+    });
+    let pressed = item.state & 0x1 != 0;
+    let disabled = item.state & 0x4 != 0;
+    let focus = item.state & 0x10 != 0 && item.state & 0x200 == 0;
+    let toolbar = VIEW.with(|v| v.get()) == View::Toolbar;
+    paint_child(item.hwnd, item.dc, item.rect, |c| {
+        let (w, h) = (item.rect.right as f32, item.rect.bottom as f32);
+        let mid = h / 2.0;
+        let focus_ring = |r: f32| {
+            if focus {
+                c.stroke_round(0.0, 0.0, w, h, r, c.k(2.0), white(0.85));
+            }
+        };
+        let card = |r: f32| {
+            let fill = if pressed { CARD_PRESSED } else { CARD };
+            c.glass_card(0.0, 0.0, w, h, r, fill, 1.0);
+        };
+        match id {
+            110..=112 => {
+                let selected = mode as u32 == id - 110;
+                let r = c.k(9.0);
+                if selected {
+                    c.glass_card(0.0, 0.0, w, h, r, SELECTED, 1.0);
+                } else if pressed {
+                    c.fill_round(0.0, 0.0, w, h, r, CARD_HOVER);
+                }
+                let color = if selected {
+                    ON_SELECTED
+                } else {
+                    TEXT_SECONDARY
+                };
+                let weight = if selected { 600 } else { 500 };
+                let tw = c.measure(&label, 14.0, weight);
+                let group = c.k(17.0) + c.k(10.0) + tw;
+                let x = (w - group) / 2.0;
+                glass_glyph(c, id, x, mid - c.k(8.5), color);
+                c.text(
+                    &label,
+                    x + c.k(27.0),
+                    0.0,
+                    tw + c.k(4.0),
+                    h,
+                    14.0,
+                    weight,
+                    Align::Left,
+                    color,
+                );
+                focus_ring(r);
+            }
+            113 => {
+                let r = c.k(12.0);
+                card(r);
+                glass_glyph(c, 113, c.k(16.0), mid - c.k(8.5), TEXT);
+                c.text(
+                    "Microphone",
+                    c.k(44.0),
+                    0.0,
+                    w - c.k(130.0),
+                    h,
+                    14.0,
+                    500,
+                    Align::Left,
+                    TEXT,
+                );
+                let (tw, th) = (c.k(36.0), c.k(20.0));
+                let tx = w - c.k(16.0) - tw;
+                let track = if mic_on { LIVE } else { white(0.22) };
+                c.fill_round(tx, mid - th / 2.0, tw, th, th / 2.0, track);
+                let knob = if mic_on {
+                    tx + tw - th / 2.0
+                } else {
+                    tx + th / 2.0
+                };
+                // Knob at 82 % of the track height.
+                c.circle(knob, mid, th * 0.41, white(0.98));
+                let state = if mic_on { "On" } else { "Off" };
+                c.text(
+                    state,
+                    tx - c.k(52.0),
+                    0.0,
+                    c.k(44.0),
+                    h,
+                    13.0,
+                    400,
+                    Align::Right,
+                    TEXT_SECONDARY,
+                );
+                focus_ring(r);
+            }
+            114 => {
+                let r = c.k(12.0);
+                card(r);
+                let tw = c.measure(&label, 14.0, 500);
+                let x = (w - (c.k(27.0) + tw)) / 2.0;
+                glass_glyph(c, 114, x, mid - c.k(8.5), TEXT);
+                c.text(
+                    &label,
+                    x + c.k(27.0),
+                    0.0,
+                    tw + c.k(4.0),
+                    h,
+                    14.0,
+                    500,
+                    Align::Left,
+                    TEXT,
+                );
+                focus_ring(r);
+            }
+            101 => {
+                let r = c.k(14.0);
+                if label == "Cancel" {
+                    // Cancelling the countdown is not a destructive or
+                    // primary action; keep red for start/stop.
+                    card(r);
+                } else {
+                    let fill = if disabled {
+                        Rgba(RECORD.0, RECORD.1, RECORD.2, 0.45)
+                    } else if pressed {
+                        RECORD_PRESSED
+                    } else {
+                        RECORD
+                    };
+                    c.glass_card(0.0, 0.0, w, h, r, fill, 1.2);
+                }
+                let size = if toolbar { 14.0 } else { 16.0 };
+                let tw = c.measure(&label, size, 600);
+                let icon = label.starts_with("Start") || label.starts_with("Stop");
+                let gap = if icon { c.k(22.0) } else { 0.0 };
+                let x = (w - (gap + tw)) / 2.0;
+                if label.starts_with("Start") {
+                    c.circle(x + c.k(6.0), mid, c.k(6.0), white(0.98));
+                } else if label.starts_with("Stop") {
+                    c.fill_round(
+                        x,
+                        mid - c.k(6.0),
+                        c.k(12.0),
+                        c.k(12.0),
+                        c.k(3.0),
+                        white(0.98),
+                    );
+                }
+                c.text(
+                    &label,
+                    x + gap,
+                    0.0,
+                    tw + c.k(4.0),
+                    h,
+                    size,
+                    600,
+                    Align::Left,
+                    TEXT,
+                );
+                focus_ring(r);
+            }
+            103 | 104 | 116 | 117 => {
+                let r = c.k(9.0);
+                card(r);
+                let shown = if id == 116 || id == 117 {
+                    "Change"
+                } else {
+                    &label
+                };
+                let color = if disabled { white(0.35) } else { TEXT };
+                c.text(shown, 0.0, 0.0, w, h, 13.0, 500, Align::Center, color);
+                focus_ring(r);
+            }
+            115 => {
+                let r = c.k(10.0);
+                card(r);
+                glass_glyph(c, 115, c.k(12.0), mid - c.k(8.5), TEXT);
+                c.text(
+                    "Back",
+                    c.k(34.0),
+                    0.0,
+                    w - c.k(40.0),
+                    h,
+                    14.0,
+                    500,
+                    Align::Left,
+                    TEXT,
+                );
+                focus_ring(r);
+            }
+            102 => {
+                // Save-folder card: the whole card opens the folder picker.
+                let r = c.k(12.0);
+                card(r);
+                glass_glyph(c, 210, c.k(16.0), mid - c.k(8.5), TEXT_SECONDARY);
+                c.text(
+                    &folder,
+                    c.k(46.0),
+                    0.0,
+                    w - c.k(150.0),
+                    h,
+                    13.5,
+                    500,
+                    Align::Left,
+                    TEXT,
+                );
+                let (pw, ph) = (c.k(84.0), c.k(30.0));
+                let px = w - c.k(12.0) - pw;
+                c.glass_card(px, mid - ph / 2.0, pw, ph, c.k(9.0), white(0.08), 0.8);
+                c.text(
+                    "Change",
+                    px,
+                    mid - ph / 2.0,
+                    pw,
+                    ph,
+                    13.0,
+                    500,
+                    Align::Center,
+                    TEXT,
+                );
+                focus_ring(r);
+            }
+            301..=304 => c.text(&label, 0.0, 0.0, w, h, 13.0, 600, Align::Left, white(0.78)),
+            210 => glass_glyph(c, 210, 0.0, (h - c.k(17.0)) / 2.0, TEXT_SECONDARY),
+            204 if toolbar => {
+                // Live dot only once capture runs, not during the countdown.
+                let recording = label.starts_with("Recording  ");
+                let mut x = 0.0;
+                if recording {
+                    c.circle(c.k(6.0), mid, c.k(5.0), RECORD);
+                    x = c.k(20.0);
+                }
+                c.text(&label, x, 0.0, w - x, h, 14.0, 600, Align::Left, TEXT);
+            }
+            209 => c.text(&label, 0.0, 0.0, w, h, 14.0, 500, Align::Left, TEXT),
+            204 if label == "Ready" => c.text(
+                "Stop anytime with Ctrl+Shift+F9",
+                0.0,
+                0.0,
+                w,
+                h,
+                12.5,
+                400,
+                Align::Left,
+                white(0.62),
+            ),
+            204 | 208 | 211 => {
+                c.text(
+                    &label,
+                    0.0,
+                    0.0,
+                    w,
+                    h,
+                    13.0,
+                    400,
+                    Align::Left,
+                    TEXT_SECONDARY,
+                );
+            }
+            _ => {}
+        }
+    });
+    true
+}
+/// Closed-state source picker on glass; the drop-down list is a separate
+/// popup window and keeps its native rendering.
+fn paint_glass_combo(hwnd: Handle) {
+    use crate::glass::*;
+    unsafe {
+        let mut ps: PaintStruct = std::mem::zeroed();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let mut r = Rect {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetClientRect(hwnd, &mut r);
+        let label = text(hwnd);
+        let focused = GetFocus() == hwnd;
+        let mode = STATE.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|state| state.as_ref().map(|s| s.mode))
+                .unwrap_or(0)
+        });
+        paint_child(hwnd, dc, r, |c| {
+            let (w, h) = (r.right as f32, r.bottom as f32);
+            let radius = c.k(12.0);
+            c.glass_card(0.0, 0.0, w, h, radius, CARD, 1.0);
+            if focused {
+                c.stroke_round(0.0, 0.0, w, h, radius, c.k(1.5), white(0.55));
+            }
+            let left = if GetDlgCtrlID(hwnd) == 207 {
+                let glyph = if mode == 1 { 111 } else { 110 };
+                glass_glyph(c, glyph, c.k(16.0), h / 2.0 - c.k(8.5), TEXT_SECONDARY);
+                46.0
+            } else {
+                16.0
+            };
+            c.text(
+                &label,
+                c.k(left),
+                0.0,
+                w - c.k(left + 40.0),
+                h,
+                14.0,
+                500,
+                Align::Left,
+                TEXT,
+            );
+            let (cx, cy) = (w - c.k(22.0), h / 2.0);
+            c.line(
+                &[
+                    (cx - c.k(5.0), cy - c.k(2.5)),
+                    (cx, cy + c.k(2.5)),
+                    (cx + c.k(5.0), cy - c.k(2.5)),
+                ],
+                c.k(1.5),
+                TEXT_SECONDARY,
+            );
+        });
+        EndPaint(hwnd, &ps);
+    }
+}
 fn position_controls(s: &State, dpi: i32) {
     let scale = |n: i32| n * dpi / 96;
+    // Logical 96-DPI layout for a 560-wide window: 24 px gutters, 496 px
+    // content column, 8 px rhythm.
     let controls = [
-        (110, 23, 15, 126, 31),
-        (111, 151, 15, 126, 31),
-        (112, 279, 15, 128, 31),
-        (207, 20, 55, 390, 180),
-        (211, 20, 84, 300, 20),
-        (117, 325, 82, 85, 24),
-        (113, 20, 111, 235, 34),
-        (114, 265, 111, 145, 34),
-        (208, 20, 153, 390, 19),
-        (210, 20, 179, 18, 18),
-        (209, 44, 179, 255, 18),
-        (116, 320, 175, 90, 25),
-        (103, 275, 274, 135, 28),
-        (104, 166, 274, 100, 28),
-        (115, 20, 15, 115, 30),
-        (301, 20, 58, 390, 20),
-        (202, 20, 80, 390, 200),
-        (302, 20, 123, 390, 20),
-        (205, 20, 145, 390, 200),
-        (303, 20, 188, 390, 20),
-        (206, 20, 210, 390, 200),
-        (304, 20, 253, 390, 20),
-        (203, 20, 275, 290, 27),
-        (102, 320, 275, 90, 27),
+        (110, 28, 20, 162, 36),
+        (111, 191, 20, 162, 36),
+        (112, 354, 20, 162, 36),
+        (207, 24, 72, 496, 220),
+        (211, 26, 124, 380, 22),
+        (117, 428, 121, 92, 28),
+        (113, 24, 156, 244, 52),
+        (114, 276, 156, 244, 52),
+        (210, 40, 239, 17, 22),
+        (209, 68, 229, 330, 22),
+        (208, 68, 251, 330, 20),
+        (116, 416, 236, 88, 28),
+        (103, 384, 363, 136, 30),
+        (104, 272, 363, 104, 30),
+        (115, 24, 18, 88, 32),
+        (301, 26, 68, 494, 20),
+        (202, 24, 92, 496, 220),
+        (302, 26, 152, 494, 20),
+        (205, 24, 176, 496, 220),
+        (303, 26, 236, 494, 20),
+        (206, 24, 260, 496, 220),
+        (304, 26, 320, 494, 20),
+        (203, 24, 344, 386, 27),
+        (102, 24, 344, 496, 52),
     ];
     unsafe {
         for (id, x, y, w, h) in controls {
@@ -756,6 +1355,41 @@ unsafe extern "system" fn combo_subclass(
     _id: usize,
     _data: usize,
 ) -> isize {
+    let glass_combo = [207, 202, 205, 206].contains(&unsafe { GetDlgCtrlID(hwnd) });
+    if glass_combo && matches!(msg, 0x0030 | 0x031a | 0x02e3) {
+        // Font and theme changes re-measure the selection field; keep the
+        // picker as tall as the cards around it.
+        let result = unsafe { DefSubclassProc(hwnd, msg, w, l) };
+        set_picker_height(hwnd);
+        return result;
+    }
+    if crate::glass::enabled() && glass_combo {
+        match msg {
+            0x000f => {
+                paint_glass_combo(hwnd);
+                return 0;
+            }
+            0x0014 => return 1,
+            _ => {}
+        }
+        let result = unsafe { DefSubclassProc(hwnd, msg, w, l) };
+        // The combo paints its focus/selection state directly on some
+        // input; repaint through the glass path afterwards.
+        if matches!(
+            msg,
+            0x0007 | 0x0008 | 0x0100 | 0x0201 | 0x0202 | 0x014e | 0x000c | 0x0111
+        ) {
+            unsafe {
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+            }
+        }
+        if msg == 0x0082 {
+            unsafe {
+                RemoveWindowSubclass(hwnd, Some(combo_subclass), 1);
+            }
+        }
+        return result;
+    }
     let result = unsafe { DefSubclassProc(hwnd, msg, w, l) };
     if msg == 0x000f && !high_contrast() {
         unsafe {
@@ -846,6 +1480,16 @@ unsafe extern "system" fn combo_subclass(
     }
     result
 }
+/// Closed source-picker height (selection field 38 px, about 44 px overall).
+/// Resizing the combo recomputes this, so call it after moving the control.
+fn set_picker_height(picker: Handle) {
+    unsafe {
+        let height = (38 * GetDpiForWindow(picker).max(96) / 96) as isize;
+        if SendMessageW(picker, 0x154, usize::MAX, 0) != height {
+            SendMessageW(picker, 0x153, usize::MAX, height);
+        }
+    }
+}
 fn settings_path() -> PathBuf {
     PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default())
         .join("FrameLatch")
@@ -933,7 +1577,7 @@ fn source_detail(
         2 => area
             .map(|(_, _, w, h)| format!("Selected area · {w} × {h}"))
             .unwrap_or_else(|| "Select an area to record".into()),
-        1 => "Selected window".into(),
+        1 => "Records only this window".into(),
         _ => screen
             .map(|(w, h)| format!("Screen · {w} × {h}"))
             .unwrap_or_else(|| "Select a screen".into()),
@@ -975,9 +1619,9 @@ fn update_summary(s: &State) {
         .unwrap_or(crate::quality::Quality::Standard)
         .summary();
     let clicks = match unsafe { SendMessageW(s.click_style, 0x147, 0, 0) } {
-        1 => "Red ring",
-        2 => "Red ripple",
-        _ => "Clicks off",
+        1 => "Clicks: red ring",
+        2 => "Clicks: red ripple",
+        _ => "Clicks: not shown",
     };
     set(
         unsafe { GetDlgItem(s.window, 208) },
@@ -998,29 +1642,15 @@ fn update_summary(s: &State) {
         }
     }
 }
-fn client_glass_height(target: View) -> u32 {
-    let _ = target;
-    0
-}
 fn layout(s: &State) {
     let active = s.stop.is_some() || s.countdown.is_some();
     let target = view(s.settings_open, active);
-    PANEL.with(|panel| panel.set(target == View::Panel));
-    let header = client_glass_height(target);
-    HEADER.with(|cell| cell.set(header));
-    if MICA.with(|cell| cell.get()) {
-        let margins = Margins {
-            left: 0,
-            right: 0,
-            top: (header * unsafe { GetDpiForWindow(s.window).max(96) } / 96) as i32,
-            bottom: 0,
-        };
-        unsafe {
-            DwmExtendFrameIntoClientArea(s.window, &margins);
-        }
-    }
+    VIEW.with(|v| v.set(target));
+    apply_material(s.window);
     let panel = [110, 111, 112, 207, 113, 114, 116, 208, 209, 210, 211];
-    let settings = [115, 202, 205, 206, 203, 102, 301, 302, 303, 304];
+    // The folder edit box (203) stays hidden: it holds the path, and the
+    // folder card (102) shows it and opens the picker.
+    let settings = [115, 202, 205, 206, 102, 301, 302, 303, 304];
     unsafe {
         for id in panel {
             ShowWindow(
@@ -1052,24 +1682,41 @@ fn layout(s: &State) {
                 },
             );
         }
+        ShowWindow(GetDlgItem(s.window, 203), 0);
         ShowWindow(s.status, if target == View::Settings { 0 } else { 1 });
         ShowWindow(s.button, if target == View::Settings { 0 } else { 1 });
         let dpi = GetDpiForWindow(s.window).max(96) as i32;
         let scale = |n: i32| n * dpi / 96;
         position_controls(s, dpi);
-        if target == View::Toolbar {
-            MoveWindow(s.status, scale(20), scale(16), scale(245), scale(26), 1);
-            MoveWindow(s.button, scale(280), scale(10), scale(145), scale(40), 1);
-        } else {
-            MoveWindow(s.status, scale(20), scale(277), scale(135), scale(23), 1);
-            MoveWindow(s.button, scale(20), scale(214), scale(390), scale(42), 1);
+        for combo in [s.picker, s.quality, s.microphone, s.click_style] {
+            set_picker_height(combo);
         }
+        if target == View::Toolbar {
+            MoveWindow(s.status, scale(24), scale(17), scale(250), scale(28), 1);
+            MoveWindow(s.button, scale(284), scale(10), scale(156), scale(42), 1);
+        } else {
+            MoveWindow(s.status, scale(26), scale(366), scale(240), scale(26), 1);
+            MoveWindow(s.button, scale(24), scale(296), scale(496), scale(52), 1);
+        }
+        // Exact client sizes; the frame is added for the current DPI.
         let (w, h) = match target {
-            View::Panel => (450, 355),
-            View::Settings => (450, 390),
-            View::Toolbar => (460, 110),
+            View::Panel => (544, 408),
+            View::Settings => (544, 416),
+            View::Toolbar => (464, 62),
         };
-        resize_within_work_area(s.window, scale(w), scale(h), active);
+        let mut frame = Rect {
+            left: 0,
+            top: 0,
+            right: scale(w),
+            bottom: scale(h),
+        };
+        AdjustWindowRectExForDpi(&mut frame, 0x00ca0000, 0, 0, dpi as u32);
+        resize_within_work_area(
+            s.window,
+            frame.right - frame.left,
+            frame.bottom - frame.top,
+            active,
+        );
         InvalidateRect(s.window, std::ptr::null(), 1);
     }
 }
@@ -1455,6 +2102,10 @@ fn click(s: &mut State) {
 #[allow(clippy::collapsible_if)]
 unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isize {
     match msg {
+        // WM_NCACTIVATE: keep the frame drawn active so DWM keeps the acrylic
+        // translucent while another app has focus. Activation itself still
+        // changes normally; only the frame rendering is affected.
+        0x0086 if ACRYLIC.with(|cell| cell.get()) => unsafe { DefWindowProcW(hwnd, msg, 1, l) },
         0x001a => {
             update_appearance(hwnd);
             0
@@ -1480,17 +2131,6 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
                 return 0;
             }
             let dpi = ((w >> 16) as u32).max(96);
-            if MICA.with(|mica| mica.get()) {
-                let margins = Margins {
-                    left: 0,
-                    right: 0,
-                    top: (HEADER.with(|header| header.get()) * dpi / 96) as i32,
-                    bottom: 0,
-                };
-                unsafe {
-                    DwmExtendFrameIntoClientArea(hwnd, &margins);
-                }
-            }
             reset_fonts(hwnd, dpi);
             STATE.with(|cell| {
                 if let Ok(state) = cell.try_borrow()
@@ -1521,7 +2161,8 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
             }
             BRUSH.with(|brush| brush.get())
         }
-        0x0015 => {
+        // WM_ERASEBKGND
+        0x0014 => {
             let dc = w as Handle;
             let mut rect = Rect {
                 left: 0,
@@ -1531,8 +2172,16 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
             };
             unsafe {
                 GetClientRect(hwnd, &mut rect);
+                if crate::glass::enabled() {
+                    let dpi = GetDpiForWindow(hwnd).max(96);
+                    let (w, h) = (rect.right, rect.bottom);
+                    if crate::glass::paint(dc, w, h, dpi, |c| paint_backdrop(c, w as f32, h as f32))
+                    {
+                        return 1;
+                    }
+                }
                 BRUSH.with(|brush| FillRect(dc, &rect, brush.get()));
-                if PANEL.with(|panel| panel.get()) {
+                if VIEW.with(|v| v.get()) == View::Panel {
                     let dpi = GetDpiForWindow(hwnd).max(96) as i32;
                     let k = |n: i32| n * dpi / 96;
                     let color = if high_contrast() {
@@ -1544,25 +2193,12 @@ unsafe extern "system" fn wnd(hwnd: Handle, msg: u32, w: usize, l: isize) -> isi
                     let pen = CreatePen(0, 1, color);
                     let oldb = SelectObject(dc, brush);
                     let oldp = SelectObject(dc, pen);
-                    RoundRect(dc, k(20), k(12), k(410), k(49), k(10), k(10));
+                    RoundRect(dc, k(24), k(16), k(520), k(60), k(12), k(12));
+                    RoundRect(dc, k(24), k(220), k(520), k(280), k(12), k(12));
                     SelectObject(dc, oldp);
                     SelectObject(dc, oldb);
                     DeleteObject(pen);
                     DeleteObject(brush);
-                }
-                if MICA.with(|mica| mica.get()) {
-                    let strip = Rect {
-                        left: rect.left,
-                        top: rect.top,
-                        right: rect.right,
-                        bottom: (rect.top
-                            + (HEADER.with(|header| header.get()) * GetDpiForWindow(hwnd).max(96)
-                                / 96) as i32)
-                            .min(rect.bottom),
-                    };
-                    let glass = CreateSolidBrush(0);
-                    FillRect(dc, &strip, glass);
-                    DeleteObject(glass);
                 }
             }
             1
@@ -1945,7 +2581,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         control(
             hwnd, instance, "BUTTON", "Settings", 0, 220, 101, 190, 32, 114,
         );
-        control(hwnd, instance, "STATIC", "", 0, 20, 84, 300, 20, 211);
+        control(hwnd, instance, "STATIC", "", 0x0d, 20, 84, 300, 20, 211);
         control(
             hwnd,
             instance,
@@ -1971,8 +2607,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             25,
             116,
         );
-        control(hwnd, instance, "STATIC", "", 0, 20, 143, 390, 20, 208);
-        control(hwnd, instance, "STATIC", "", 0, 20, 171, 390, 20, 209);
+        control(hwnd, instance, "STATIC", "", 0x0d, 20, 143, 390, 20, 208);
+        control(hwnd, instance, "STATIC", "", 0x0d, 20, 171, 390, 20, 209);
         let button = control(
             hwnd,
             instance,
@@ -1985,7 +2621,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             40,
             101,
         );
-        let status = control(hwnd, instance, "STATIC", "Ready", 0, 20, 251, 390, 23, 204);
+        let status = control(
+            hwnd, instance, "STATIC", "Ready", 0x0d, 20, 251, 390, 23, 204,
+        );
         let open = control(
             hwnd,
             instance,
@@ -2018,7 +2656,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             instance,
             "STATIC",
             "Quality and orientation",
-            0,
+            0x0d,
             20,
             58,
             390,
@@ -2053,7 +2691,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             instance,
             "STATIC",
             "Microphone device",
-            0,
+            0x0d,
             20,
             123,
             390,
@@ -2082,7 +2720,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             instance,
             "STATIC",
             "Mouse clicks",
-            0,
+            0x0d,
             20,
             188,
             390,
@@ -2109,7 +2747,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             instance,
             "STATIC",
             "Save folder",
-            0,
+            0x0d,
             20,
             253,
             390,
@@ -2317,6 +2955,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 DeleteObject(brush);
             }
         });
+        crate::glass::shutdown();
         CoUninitialize();
         Ok(())
     }
@@ -2324,7 +2963,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod ui_tests {
-    use super::{View, area_ready, client_glass_height, source_detail, view};
+    use super::{View, area_ready, glass_view, source_detail, view};
     #[test]
     fn active_session_always_uses_toolbar() {
         assert_eq!(view(false, false), View::Panel);
@@ -2333,10 +2972,10 @@ mod ui_tests {
         assert_eq!(view(true, true), View::Toolbar);
     }
     #[test]
-    fn charcoal_client_does_not_extend_titlebar_glass() {
-        assert_eq!(client_glass_height(View::Settings), 0);
-        assert_eq!(client_glass_height(View::Panel), 0);
-        assert_eq!(client_glass_height(View::Toolbar), 0);
+    fn every_view_is_owner_drawn_for_glass() {
+        assert!(glass_view(View::Settings));
+        assert!(glass_view(View::Panel));
+        assert!(glass_view(View::Toolbar));
     }
     #[test]
     fn area_summary_never_uses_full_screen_dimensions() {
