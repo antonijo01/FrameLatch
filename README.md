@@ -16,7 +16,7 @@ FrameLatch is built for 64-bit Windows 10 version 2004 or later and Windows 11. 
 2. Run the installer. The default installs for your account without administrator access. The wizard also offers an all-users install and an optional desktop shortcut.
 3. Open **FrameLatch** from the Start menu.
 
-The installer has yet to be published on GitHub. Until it appears under **Assets**, use a copy of the installer you already have or [build it from source](#build-from-source). Access to releases in a private repository requires access to the repository.
+You can also [build FrameLatch from source](#build-from-source) and run it directly.
 
 Windows SmartScreen may show a warning for the unsigned installer. Run the file only if you trust its source. To uninstall, find **FrameLatch** under **Settings → Apps**. Your recordings and settings are kept.
 
