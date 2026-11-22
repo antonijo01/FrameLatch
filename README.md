@@ -128,3 +128,9 @@ On one Windows 11 development laptop, the glass interface used about 13 MiB of p
 
 - Microphones must use 44.1 or 48 kHz. Devices with the same name are rejected, and recording stops if the microphone timestamps jump by more than 250 ms.
 - Long-session microphone sync, mixed-DPI displays, microphone unplugging, and a full disk still need dedicated validation. See [outstanding desktop checks](docs/desktop-validation.md#outstanding-qualification).
+
+## License and support
+
+FrameLatch is free to use under the [MIT License](LICENSE). See the [third-party notices](THIRD-PARTY-NOTICES.txt) for licenses and credits for included components.
+
+If you’d like to support development, you can [buy Antonijo a coffee](https://buymeacoffee.com/antonijo01).
